@@ -398,6 +398,55 @@ static char *driver_short_names[] = {
 };
 
 #ifdef CONFIG_X86
+#ifdef CONFIG_SND_DMA_SGBUF
+#include <linux/vmalloc.h>
+#include <linux/sched.h>
+#include <asm/paravirt.h>
+
+static int bad_address(void *p)
+{
+	unsigned long dummy;
+
+	return probe_kernel_address((unsigned long *)p, dummy);
+}
+
+static pte_t * dump_pte(unsigned long address)
+{
+	pgd_t *base = __va(read_cr3() & PHYSICAL_PAGE_MASK);
+	pgd_t *pgd = base + pgd_index(address);
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+
+	if (bad_address(pgd))
+		goto bad;
+
+	if (!pgd_present(*pgd))
+		goto bad;
+
+	pud = pud_offset(pgd, address);
+	if (bad_address(pud))
+		goto bad;
+
+	if (!pud_present(*pud) || pud_large(*pud))
+		goto bad;
+
+	pmd = pmd_offset(pud, address);
+	if (bad_address(pmd))
+		goto bad;
+
+	if (!pmd_present(*pmd) || pmd_large(*pmd))
+		goto bad;
+
+	pte = pte_offset_kernel(pmd, address);
+	if (bad_address(pte))
+		goto bad;
+
+	return pte;
+bad:
+	return NULL;
+}
+#endif
 static void __mark_pages_wc(struct azx *chip, struct snd_dma_buffer *dmab, bool on)
 {
 	int pages;
@@ -410,12 +459,28 @@ static void __mark_pages_wc(struct azx *chip, struct snd_dma_buffer *dmab, bool 
 #ifdef CONFIG_SND_DMA_SGBUF
 	if (dmab->dev.type == SNDRV_DMA_TYPE_DEV_SG) {
 		struct snd_sg_buf *sgbuf = dmab->private_data;
+		pgprot_t prot;
+		int i;
+		unsigned long addr;
+		pte_t * pte;
 		if (chip->driver_type == AZX_DRIVER_CMEDIA)
 			return; /* deal with only CORB/RIRB buffers */
-		if (on)
+		if (on){
 			set_pages_array_wc(sgbuf->page_table, sgbuf->pages);
-		else
+			prot = pgprot_writecombine(PAGE_KERNEL);
+		}
+		else{
 			set_pages_array_wb(sgbuf->page_table, sgbuf->pages);
+			prot = PAGE_KERNEL;
+		}
+		for (i = 0; i < sgbuf->pages; i ++)
+		{
+			addr = (unsigned long)dmab->area + PAGE_SIZE * i;
+			pte = dump_pte(addr);
+			if (pte)
+				set_pte_at(&init_mm, addr, pte, mk_pte(sgbuf->page_table[i], prot));
+			else WARN_ON(1);
+		}
 		return;
 	}
 #endif
